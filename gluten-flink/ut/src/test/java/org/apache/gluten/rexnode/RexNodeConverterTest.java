@@ -16,15 +16,23 @@
  */
 package org.apache.gluten.rexnode;
 
+import org.apache.gluten.rexnode.functions.RexCallConverterFactory;
+
+import io.github.zhztheplayer.velox4j.expression.CallTypedExpr;
+import io.github.zhztheplayer.velox4j.type.VarCharType;
 import io.github.zhztheplayer.velox4j.variant.VarCharValue;
 import io.github.zhztheplayer.velox4j.variant.Variant;
 
 import org.apache.flink.table.planner.calcite.FlinkRexBuilder;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
 import org.apache.flink.table.planner.calcite.FlinkTypeSystem;
+import org.apache.flink.table.planner.functions.sql.FlinkSqlOperatorTable;
 
 import org.apache.calcite.rex.RexBuilder;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
+import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -62,5 +70,41 @@ public class RexNodeConverterTest {
     Variant variant = RexNodeConverter.toVariant(literal);
     assertThat(variant).isInstanceOf(VarCharValue.class);
     assertThat(((VarCharValue) variant).getValue()).isEqualTo("banana");
+  }
+
+  @Test
+  public void testSha2FamilyCallsMapToVeloxNames() {
+    RexInputRef stringFieldRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.VARCHAR), 1);
+    RexInputRef intFieldRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 2);
+    RexConversionContext context =
+        new RexConversionContext(java.util.Arrays.asList("ignored", "s", "n"));
+
+    RexCall sha2 =
+        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, intFieldRef);
+    CallTypedExpr sha2Expr =
+        (CallTypedExpr)
+            RexCallConverterFactory.getConverter(sha2, context).toTypedExpr(sha2, context);
+    assertThat(sha2Expr.getFunctionName()).isEqualTo("sha2");
+    assertThat(sha2Expr.getReturnType()).isInstanceOf(VarCharType.class);
+    assertThat(sha2Expr.getInputs()).hasSize(2);
+
+    SqlFunction[] fixedLengthOps = {
+      FlinkSqlOperatorTable.SHA224,
+      FlinkSqlOperatorTable.SHA256,
+      FlinkSqlOperatorTable.SHA384,
+      FlinkSqlOperatorTable.SHA512
+    };
+    String[] veloxNames = {"sha224", "sha256", "sha384", "sha512"};
+    for (int i = 0; i < fixedLengthOps.length; i++) {
+      RexCall call = (RexCall) rexBuilder.makeCall(fixedLengthOps[i], stringFieldRef);
+      CallTypedExpr expr =
+          (CallTypedExpr)
+              RexCallConverterFactory.getConverter(call, context).toTypedExpr(call, context);
+      assertThat(expr.getFunctionName()).isEqualTo(veloxNames[i]);
+      assertThat(expr.getReturnType()).isInstanceOf(VarCharType.class);
+      assertThat(expr.getInputs()).hasSize(1);
+    }
   }
 }
