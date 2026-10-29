@@ -19,7 +19,10 @@ package org.apache.gluten.rexnode;
 import org.apache.gluten.rexnode.functions.RexCallConverterFactory;
 
 import io.github.zhztheplayer.velox4j.expression.CallTypedExpr;
+import io.github.zhztheplayer.velox4j.expression.ConstantTypedExpr;
+import io.github.zhztheplayer.velox4j.type.IntegerType;
 import io.github.zhztheplayer.velox4j.type.VarCharType;
+import io.github.zhztheplayer.velox4j.variant.IntegerValue;
 import io.github.zhztheplayer.velox4j.variant.VarCharValue;
 import io.github.zhztheplayer.velox4j.variant.Variant;
 
@@ -106,5 +109,32 @@ public class RexNodeConverterTest {
       assertThat(expr.getReturnType()).isInstanceOf(VarCharType.class);
       assertThat(expr.getInputs()).hasSize(1);
     }
+  }
+
+  @Test
+  public void testSha2LiteralZeroLengthPassesThrough() {
+    // The hash-length 0 rejection is pinned at velox execution time, matching
+    // Flink 1.19.2's runtime rejection; the planner must not special-case 0.
+    // A folded literal 0 therefore converts like any other length and reaches
+    // velox intact instead of being rejected at conversion time.
+    RexInputRef stringFieldRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.VARCHAR), 1);
+    RexLiteral zeroLength =
+        (RexLiteral)
+            rexBuilder.makeLiteral(0, typeFactory.createSqlType(SqlTypeName.INTEGER), false);
+    RexConversionContext context =
+        new RexConversionContext(java.util.Arrays.asList("ignored", "s", "n"));
+
+    RexCall sha2 =
+        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, zeroLength);
+    CallTypedExpr expr =
+        (CallTypedExpr)
+            RexCallConverterFactory.getConverter(sha2, context).toTypedExpr(sha2, context);
+    assertThat(expr.getFunctionName()).isEqualTo("sha2");
+    assertThat(expr.getInputs()).hasSize(2);
+    assertThat(expr.getInputs().get(1)).isInstanceOf(ConstantTypedExpr.class);
+    ConstantTypedExpr length = (ConstantTypedExpr) expr.getInputs().get(1);
+    assertThat(length.getReturnType()).isInstanceOf(IntegerType.class);
+    assertThat(((IntegerValue) length.getValue()).getValue()).isEqualTo(0);
   }
 }
