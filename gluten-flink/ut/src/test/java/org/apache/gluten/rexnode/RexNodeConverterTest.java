@@ -20,8 +20,10 @@ import org.apache.gluten.rexnode.functions.RexCallConverterFactory;
 
 import io.github.zhztheplayer.velox4j.expression.CallTypedExpr;
 import io.github.zhztheplayer.velox4j.expression.ConstantTypedExpr;
+import io.github.zhztheplayer.velox4j.type.BigIntType;
 import io.github.zhztheplayer.velox4j.type.IntegerType;
 import io.github.zhztheplayer.velox4j.type.VarCharType;
+import io.github.zhztheplayer.velox4j.variant.BigIntValue;
 import io.github.zhztheplayer.velox4j.variant.IntegerValue;
 import io.github.zhztheplayer.velox4j.variant.VarCharValue;
 import io.github.zhztheplayer.velox4j.variant.Variant;
@@ -45,6 +47,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class RexNodeConverterTest {
 
@@ -116,30 +119,89 @@ public class RexNodeConverterTest {
   }
 
   @Test
-  public void testSha2LiteralZeroLengthPassesThrough() {
-    // The hash-length 0 rejection is pinned at velox execution time, matching
-    // Flink 1.19.2's runtime rejection; the planner must not special-case 0.
-    // A folded literal 0 therefore converts like any other length and reaches
-    // velox intact instead of being rejected at conversion time.
+  public void testSha2LiteralInvalidLengthRejected() {
+    // Flink validates a constant hashLength in the generated operator's
+    // constructor (CodeGeneratorContext#addReusableSha2MessageDigest throws
+    // "Unsupported algorithm." for anything outside {224, 256, 384, 512}) and
+    // fails the job even on empty input; the conversion rejects the constant
+    // form the same way, while the column form keeps the per-row rejection.
     RexInputRef stringFieldRef =
         rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.VARCHAR), 1);
-    RexLiteral zeroLength =
-        (RexLiteral)
-            rexBuilder.makeLiteral(0, typeFactory.createSqlType(SqlTypeName.INTEGER), false);
     RexConversionContext context =
         new RexConversionContext(java.util.Arrays.asList("ignored", "s", "n"));
 
-    RexCall sha2 =
-        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, zeroLength);
-    CallTypedExpr expr =
+    int[] invalidLengths = {0, 385, -1};
+    for (int length : invalidLengths) {
+      RexLiteral literal =
+          (RexLiteral)
+              rexBuilder.makeLiteral(length, typeFactory.createSqlType(SqlTypeName.INTEGER), false);
+      RexCall call =
+          (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, literal);
+      assertThatThrownBy(() -> RexCallConverterFactory.getConverter(call, context))
+          .hasMessageContaining(
+              String.format("SHA2 with literal hashLength %d is not supported", length));
+    }
+
+    // The BIGINT form (a folded CAST(... AS BIGINT)) rejects too.
+    RexLiteral bigZero =
+        (RexLiteral)
+            rexBuilder.makeLiteral(0L, typeFactory.createSqlType(SqlTypeName.BIGINT), false);
+    RexCall bigCall =
+        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, bigZero);
+    assertThatThrownBy(() -> RexCallConverterFactory.getConverter(bigCall, context))
+        .hasMessageContaining("SHA2 with literal hashLength 0 is not supported");
+  }
+
+  @Test
+  public void testSha2LiteralValidAndNullLengthStillConvert() {
+    RexInputRef stringFieldRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.VARCHAR), 1);
+    RexConversionContext context =
+        new RexConversionContext(java.util.Arrays.asList("ignored", "s", "n"));
+
+    // A valid INT constant reaches velox intact.
+    RexLiteral intLength =
+        (RexLiteral)
+            rexBuilder.makeLiteral(256, typeFactory.createSqlType(SqlTypeName.INTEGER), false);
+    RexCall intCall =
+        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, intLength);
+    CallTypedExpr intExpr =
         (CallTypedExpr)
-            RexCallConverterFactory.getConverter(sha2, context).toTypedExpr(sha2, context);
-    assertThat(expr.getFunctionName()).isEqualTo("sha2");
-    assertThat(expr.getInputs()).hasSize(2);
-    assertThat(expr.getInputs().get(1)).isInstanceOf(ConstantTypedExpr.class);
-    ConstantTypedExpr length = (ConstantTypedExpr) expr.getInputs().get(1);
+            RexCallConverterFactory.getConverter(intCall, context).toTypedExpr(intCall, context);
+    assertThat(intExpr.getFunctionName()).isEqualTo("sha2");
+    assertThat(intExpr.getInputs()).hasSize(2);
+    ConstantTypedExpr length = (ConstantTypedExpr) intExpr.getInputs().get(1);
     assertThat(length.getReturnType()).isInstanceOf(IntegerType.class);
-    assertThat(((IntegerValue) length.getValue()).getValue()).isEqualTo(0);
+    assertThat(((IntegerValue) length.getValue()).getValue()).isEqualTo(256);
+
+    // A valid BIGINT constant routes through the int64 signature.
+    RexLiteral bigLength =
+        (RexLiteral)
+            rexBuilder.makeLiteral(512L, typeFactory.createSqlType(SqlTypeName.BIGINT), false);
+    RexCall bigCall =
+        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, bigLength);
+    CallTypedExpr bigExpr =
+        (CallTypedExpr)
+            RexCallConverterFactory.getConverter(bigCall, context).toTypedExpr(bigCall, context);
+    assertThat(bigExpr.getFunctionName()).isEqualTo("sha2");
+    ConstantTypedExpr bigLengthExpr = (ConstantTypedExpr) bigExpr.getInputs().get(1);
+    assertThat(bigLengthExpr.getReturnType()).isInstanceOf(BigIntType.class);
+    assertThat(((BigIntValue) bigLengthExpr.getValue()).getValue()).isEqualTo(512L);
+
+    // A NULL constant cannot be checked at plan time; it converts like any
+    // other NULL carrier and keeps the per-row rejection in velox.
+    RexLiteral nullLength =
+        (RexLiteral) rexBuilder.makeNullLiteral(typeFactory.createSqlType(SqlTypeName.INTEGER));
+    RexCall nullCall =
+        (RexCall) rexBuilder.makeCall(FlinkSqlOperatorTable.SHA2, stringFieldRef, nullLength);
+    CallTypedExpr nullExpr =
+        (CallTypedExpr)
+            RexCallConverterFactory.getConverter(nullCall, context).toTypedExpr(nullCall, context);
+    assertThat(nullExpr.getFunctionName()).isEqualTo("sha2");
+    assertThat(nullExpr.getInputs()).hasSize(2);
+    Variant nullVariant = ((ConstantTypedExpr) nullExpr.getInputs().get(1)).getValue();
+    assertThat(nullVariant).isInstanceOf(VarCharValue.class);
+    assertThat(((VarCharValue) nullVariant).getValue()).isNull();
   }
 
   @Test

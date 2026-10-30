@@ -130,6 +130,24 @@ class HashFunctionsTest extends GlutenStreamingTestBase {
   }
 
   @Test
+  void testSha2ConstantInvalidLengthRejectedAtConversion() {
+    // Flink fails a job with a bad constant hashLength in the generated
+    // operator's constructor — even on empty input, since the check is
+    // input-independent; the conversion rejects it the same way, while the
+    // column form keeps the per-row runtime rejection.
+    List<Row> rows = Arrays.asList(Row.of("test"));
+    createSimpleBoundedValuesTable("tblSha2ConstBad", "s varchar", rows);
+    tEnv().executeSql("CREATE TABLE printT (d VARCHAR) WITH ('connector' = 'print')");
+    assertThatThrownBy(
+            () -> tEnv().executeSql("insert into printT select SHA2(s, 0) from tblSha2ConstBad"))
+        .hasStackTraceContaining("SHA2 with literal hashLength 0 is not supported");
+    assertThatThrownBy(
+            () -> tEnv().executeSql("insert into printT select SHA2(s, 385) from tblSha2ConstBad"))
+        .hasStackTraceContaining("SHA2 with literal hashLength 385 is not supported");
+    tEnv().executeSql("drop table if exists printT");
+  }
+
+  @Test
   void testSha224() {
     List<Row> rows = Arrays.asList(Row.of(""), Row.of("test"), Row.of("你好世界"), Row.of(LONG_INPUT));
     createSimpleBoundedValuesTable("tblSha224", "s varchar", rows);
